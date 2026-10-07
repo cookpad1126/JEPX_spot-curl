@@ -1,0 +1,516 @@
+"""
+OCCTO 連系線潮流実績 CSV 自動ダウンロード (Playwright)
+- 対象日(直近N日)× 連系線(全件) を順番に取得
+- タイムアウト/エラー時は最初から再接続し、未取得分だけリトライ
+- ファイル名は 日付+連系線 で固定 → 再実行しても上書きされ、重複しない
+- 保存先フォルダを Power BI の「フォルダ」コネクタで読み込む
+
+事前準備:
+    pip install playwright
+    playwright install chromium
+"""
+import csv
+import datetime as dt
+import io
+import logging
+import pathlib
+import random
+import re
+import sys
+import time
+
+from playwright.sync_api import sync_playwright
+
+# ============================================================
+# 設定
+# ============================================================
+START_URL = "https://occtonet3.occto.or.jp/public/dfw/RP11/OCCTO/SD/LOGIN_login"
+ENTRY_URL = ("https://occtonet3.occto.or.jp/public/dfw/RP11/OCCTO/SD/CE01S050C"
+             "?fwExtention.pathInfo=CE01S050C&fwExtention.prgbrh=0")
+
+# ---- 取得する日付 ----
+DAYS = 150              # 何日分(テスト用に3日。本番は7)
+INCLUDE_TODAY = True  # True: 今日を含むDAYS日分(最新データが欲しいなら True) / False: 昨日まで
+
+# ---- 日付フォームの設定 ----
+DATE_SELECTOR = "#spcDay"          # 日付入力欄(codegenで確認済み)
+# 日付の設定方法。上から順に試し、保存したCSVの中身の日付が一致した方法を以後使い続ける。
+#   "jqui"  : jQuery UI の datepicker の API で日付を設定(月またぎOK)
+#   "picker": カレンダーを開き、前月/翌月ボタンで月を合わせて日をクリック(月またぎOK)
+#   "js"    : 入力欄の文字列だけを書き換える(★サーバーに反映されないことが判明。通常は使わない)
+DATE_METHODS = ["jqui", "picker"]
+DATE_FORMAT_FALLBACK = "%Y/%m/%d"  # "js" 方式でのみ使用
+CALENDAR_STEP_TIMEOUT_MS = 8_000   # カレンダー操作1手ごとの待ち時間
+
+# ---- 連系線 ----
+#TARGET_VALUES = ["07", "08", "09", "10"]   # テスト用に4連系線(本番は None=全件)
+TARGET_VALUES = None   # 全連系線
+EXCLUDE_VALUES = {""}         # 全件取得時に除外する値
+
+# ---- 保存・動作 ----
+OUT_DIR = pathlib.Path(r"C:\data\occto")
+FILE_PREFIX = "occto"
+MAX_RETRIES = len([60, 180, 300, 600, 900])  # 連続失敗の上限(=バックオフ段数)
+RETRY_WAIT_SEC = 30           # 計画的な再接続の前の待ち(秒)
+# 失敗後の再接続までの待ち(秒)。失敗が続くほど長くする(サーバー側の回復を待つ)
+RETRY_BACKOFF_SEC = [60, 180, 300, 600, 900]
+SKIP_FINAL_FILES = True          # 確定済みの(日付, 連系線)は取り直さない
+# 「その日から N 日以上たってから保存したファイル」を確定済みとみなす。
+# 2 なら、今日と昨日は毎回取り直し、2日前以前は一度取れば再取得しない。
+FINAL_AFTER_DAYS = 2
+LOCK_STALE_SEC = 2 * 3600        # ロックファイルがこれより古ければ、残骸として無視する
+INTERVAL_SEC = 4             # 1件取得ごとの待ち(秒)。タイムアウトが続くなら増やす
+INTERVAL_JITTER_SEC = 3       # 待ち時間にランダムで足す最大秒数
+MAX_PER_SESSION = 5           # この件数ごとに計画的に再接続する(エラーではない)
+FORM_WAIT_SEC = 10            # 検索画面を開いた後、入力フォームの表示を待ってからさらに待つ秒数
+SEARCH_SETTLE_SEC = 2.0       # 検索の応答後、CSV保存を押すまでの追加待ち(秒)
+SETTLE_TIMEOUT_MS = 15_000    # ダウンロード後に通信が落ち着くのを待つ最大時間
+PAGE_TIMEOUT_MS = 60_000
+HEADLESS = True               # 動作確認中は False
+ERROR_TEXTS = ["タイムアウト", "セッションが切れ", "エラーが発生", "不正なリクエスト"]
+
+
+# ============================================================
+# 画面操作
+# ============================================================
+def find_page_with(context, text, timeout_sec=30):
+    end = time.time() + timeout_sec
+    while time.time() < end:
+        for pg in context.pages:
+            try:
+                if pg.get_by_text(text).first.is_visible():
+                    return pg
+            except Exception:
+                pass
+        time.sleep(1)
+    raise RuntimeError(f"'{text}' が表示されているタブが見つかりません")
+
+
+def open_menu(page):
+    """業務画面を開き、メニューが表示されているタブを返す"""
+    context = page.context
+    app = context.new_page()
+    app.goto(ENTRY_URL, wait_until="domcontentloaded")
+    return find_page_with(context, "地域間連系線情報")
+
+
+def wait_form_ready(page2):
+    """検索画面の入力フォーム(日付・連系線・検索ボタン)が使える状態になるまで待つ"""
+    page2.locator(DATE_SELECTOR).wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+    page2.locator("#tgtRkl").wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+    page2.get_by_role("button", name="検索").wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+    # 連系線の選択肢が読み込まれるまで
+    page2.wait_for_function(
+        "() => document.querySelectorAll('#tgtRkl option').length > 1",
+        timeout=PAGE_TIMEOUT_MS,
+    )
+    # カレンダー部品(jQuery UI)の初期化を待つ。無い画面でも続行する
+    try:
+        page2.wait_for_function(
+            "() => window.jQuery && window.jQuery.datepicker", timeout=10_000)
+    except Exception:
+        pass
+    # 画面が表示されても、裏で初期化が続くことがあるため、固定でも待つ
+    log.info("フォーム表示を確認。さらに%d秒待ちます", FORM_WAIT_SEC)
+    time.sleep(FORM_WAIT_SEC)
+
+
+def open_popup(menu):
+    """メニューから「連系線潮流実績」の検索画面(ポップアップ)を新しく開いて返す"""
+    item = menu.get_by_text("連系線潮流実績")
+    try:
+        opened = item.first.is_visible()
+    except Exception:
+        opened = False
+    if not opened:   # サブメニューが閉じていれば開く
+        menu.get_by_text("地域間連系線情報").click()
+        menu.locator("#menu1-1-3").get_by_text("連系線 潮流情報参照").click()
+    with menu.expect_popup() as popup_info:
+        menu.get_by_text("連系線潮流実績").click()
+    page2 = popup_info.value
+    page2.wait_for_load_state("domcontentloaded")
+    wait_form_ready(page2)
+    return page2
+
+
+def list_targets(page2, timeout_sec=30):
+    """#tgtRkl の選択肢を [(値, 名称), ...] で返す。読み込まれるまで待ち、空ならエラーにする。"""
+    end = time.time() + timeout_sec
+    while True:
+        opts = page2.locator("#tgtRkl option").evaluate_all(
+            "els => els.map(e => [e.value, (e.textContent || '').trim()])"
+        )
+        result = [(v, t) for v, t in opts if v not in EXCLUDE_VALUES]
+        if result:
+            return result
+        if time.time() > end:
+            raise RuntimeError("連系線の選択肢を取得できません(画面の読み込み未完了またはエラー画面の可能性)")
+        time.sleep(1)
+
+
+def format_like(current, d, fallback_fmt):
+    """入力欄の現在値(例 '2026/10/07' '2026年10月7日' '20261007')と同じ書式で d を文字列化する"""
+    m = re.fullmatch(r"(\D*)(\d{4})(\D*)(\d{1,2})(\D*)(\d{1,2})(\D*)", current.strip())
+    if m:
+        pre, y, s1, mo, s2, dd, post = m.groups()
+        mo_s = f"{d.month:02d}" if len(mo) == 2 else str(d.month)
+        dd_s = f"{d.day:02d}" if len(dd) == 2 else str(d.day)
+        return f"{pre}{d.year}{s1}{mo_s}{s2}{dd_s}{post}"
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", current.strip())
+    if m:
+        return d.strftime("%Y%m%d")
+    return d.strftime(fallback_fmt)
+
+
+class DateSetError(RuntimeError):
+    """その日付設定方式が使えない/失敗した(別の方式を試す)"""
+
+
+class FatalError(RuntimeError):
+    """リトライしても直らない問題(全方式で日付が合わない等)"""
+
+
+STATE = {"method": None, "failed": set()}   # method: 正しく反映された方式(以後これを最優先) / failed: 不一致だった方式
+
+
+def displayed_month(page2):
+    """カレンダーが現在表示している (年, 月) を返す"""
+    r = page2.evaluate(
+        """(sel) => {
+            const j = window.jQuery;
+            if (!j || !j.datepicker || !j.datepicker._getInst) return null;
+            const el = j(sel)[0];
+            const inst = el && j.datepicker._getInst(el);
+            return inst ? [inst.drawYear, inst.drawMonth + 1] : null;
+        }""",
+        DATE_SELECTOR,
+    )
+    if r:
+        return int(r[0]), int(r[1])
+    title = page2.locator(".ui-datepicker-title").first.inner_text(timeout=CALENDAR_STEP_TIMEOUT_MS)
+    y = re.search(r"(\d{4})", title)
+    m = re.search(r"(\d{1,2})\s*月", title)
+    if not (y and m):
+        raise DateSetError(f"カレンダーの表示月を読み取れません: '{title[:30]}'")
+    return int(y.group(1)), int(m.group(1))
+
+
+def set_date(page2, d, method):
+    """対象日付フォームに日付 d (datetime.date) を設定する"""
+    box = page2.locator(DATE_SELECTOR)
+    if method == "jqui":
+        r = page2.evaluate(
+            """([sel, y, m, d]) => {
+                const j = window.jQuery;
+                if (!j || !j.datepicker) return 'nodp';
+                j(sel).datepicker('setDate', new Date(y, m - 1, d));
+                j(sel).trigger('change');
+                return 'ok';
+            }""",
+            [DATE_SELECTOR, d.year, d.month, d.day],
+        )
+        if r != "ok":
+            raise DateSetError("jQuery UI の datepicker が見つかりません")
+    elif method == "picker":
+        try:
+            box.click(timeout=CALENDAR_STEP_TIMEOUT_MS)
+            for _ in range(36):                       # 最大3年分まで月送り
+                cur = displayed_month(page2)
+                target = (d.year, d.month)
+                if cur == target:
+                    break
+                nav = ".ui-datepicker-prev" if target < cur else ".ui-datepicker-next"
+                page2.locator(nav).first.click(timeout=CALENDAR_STEP_TIMEOUT_MS)
+            else:
+                raise DateSetError("カレンダーの月を合わせられません")
+            cal = page2.locator(".ui-datepicker-calendar")
+            scope = cal if cal.count() > 0 else page2
+            scope.get_by_role("link", name=str(d.day), exact=True).click(timeout=CALENDAR_STEP_TIMEOUT_MS)
+        except DateSetError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise DateSetError(f"カレンダー操作に失敗: {str(e).splitlines()[0]}") from e
+    elif method == "js":
+        current = box.input_value()
+        text = format_like(current, d, DATE_FORMAT_FALLBACK)
+        box.evaluate(
+            """(el, v) => {
+                el.removeAttribute('readonly');
+                el.value = v;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""",
+            text,
+        )
+    else:
+        raise RuntimeError(f"未対応の日付設定方式: {method}")
+    log.info("日付設定(%s): %s -> 入力欄 '%s'", method, d, box.input_value())
+
+
+def fetch_one(page2, value):
+    """連系線を選択→検索→CSV保存。日付は事前に set_date 済みであること。
+    検索の応答が返る前にCSV保存を押すと、検索条件が反映されず別の日付(今日)のCSVになったり、
+    「不正なリクエスト」になるため、検索の完了を確実に待ってから進む。"""
+    page2.locator("#tgtRkl").select_option(value)
+    with page2.expect_response(
+        lambda r: r.request.resource_type in ("document", "xhr", "fetch"),
+        timeout=PAGE_TIMEOUT_MS,
+    ):
+        page2.get_by_role("button", name="検索").click()
+    page2.wait_for_load_state("domcontentloaded")
+    settle(page2)                      # 通信が落ち着くまで待つ
+    time.sleep(SEARCH_SETTLE_SEC)      # 念のための追加待ち
+    check_error_page(page2)
+    page2.get_by_role("button", name="CSV保存").click()
+    with page2.expect_download(timeout=PAGE_TIMEOUT_MS) as dl_info:
+        page2.get_by_role("button", name="OK").click()
+    return dl_info.value
+
+
+# ============================================================
+# 共通処理
+# ============================================================
+OUT_DIR.parent.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(OUT_DIR.parent / "occto_download.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("occto")
+
+
+def check_error_page(page):
+    body = page.inner_text("body")
+    for t in ERROR_TEXTS:
+        if t in body:
+            raise RuntimeError(f"エラー画面を検出: '{t}'")
+
+
+def safe(s):
+    return re.sub(r'[\\/:*?"<>|\s]+', "_", s)
+
+
+def target_dates():
+    end = dt.date.today() if INCLUDE_TODAY else dt.date.today() - dt.timedelta(days=1)
+    return [end - dt.timedelta(days=i) for i in range(DAYS - 1, -1, -1)]  # 古い順
+
+
+def csv_dates(path):
+    """CSVの『対象日付』列にある日付の集合(Shift-JIS/UTF-8どちらも可)"""
+    raw = pathlib.Path(path).read_bytes()
+    for enc in ("utf-8-sig", "cp932"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        return set()
+    out = set()
+    for row in csv.DictReader(io.StringIO(text)):
+        v = (row.get("対象日付") or "").strip()
+        try:
+            out.add(dt.datetime.strptime(v, "%Y/%m/%d").date())
+        except ValueError:
+            pass
+    return out
+
+
+def already_final(d, value):
+    """この (日付, 連系線) が確定済み(正しい中身で、その日からFINAL_AFTER_DAYS日以上後に保存)か"""
+    if not SKIP_FINAL_FILES:
+        return False
+    for f in OUT_DIR.glob(f"{FILE_PREFIX}_{d:%Y%m%d}_{value}_*.csv"):
+        saved = dt.date.fromtimestamp(f.stat().st_mtime)
+        if saved >= d + dt.timedelta(days=FINAL_AFTER_DAYS) and csv_dates(f) == {d}:
+            return True
+    return False
+
+
+def save_download(dl, d, value, label):
+    """中身の日付が d と一致する場合だけ保存する。保存したら True、日付不一致なら False。"""
+    dest = OUT_DIR / f"{FILE_PREFIX}_{d:%Y%m%d}_{value}_{safe(label)}.csv"
+    tmp = OUT_DIR / f".tmp_{d:%Y%m%d}_{value}.part"
+    dl.save_as(tmp)
+    dates = csv_dates(tmp)
+    if not dates:
+        log.warning("CSVに日付データがありません(空?)。保存しません: %s 連系線%s", d, value)
+        tmp.unlink()
+        return True                      # 方式の問題ではないので、このコマは完了扱い
+    if dates != {d}:
+        log.warning("中身の日付が不一致: 期待 %s / 実際 %s → 保存しません",
+                    d, ",".join(str(x) for x in sorted(dates)))
+        tmp.unlink()
+        return False
+    tmp.replace(dest)                    # 同名があれば上書き
+    log.info("保存: %s", dest.name)
+    return True
+
+
+def settle(page2):
+    """ダウンロード後、画面の通信が落ち着くまで待つ(失敗しても続行)"""
+    try:
+        page2.wait_for_load_state("networkidle", timeout=SETTLE_TIMEOUT_MS)
+    except Exception:
+        pass
+
+
+def run_session(done, dates):
+    """1回の接続で未取得の (日付, 連系線) を取得する。
+    全件完了なら True、MAX_PER_SESSION に達して計画的に切った場合は False を返す。"""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context(accept_downloads=True, locale="ja-JP")
+        context.set_default_timeout(PAGE_TIMEOUT_MS)
+        page = context.new_page()
+        try:
+            page.goto(START_URL, wait_until="domcontentloaded")
+            check_error_page(page)
+
+            menu = open_menu(page)
+            page2 = open_popup(menu)
+            check_error_page(page2)
+
+            options = list_targets(page2)
+            if TARGET_VALUES is not None:
+                options = [(v, t) for v, t in options if v in TARGET_VALUES]
+            if not options:
+                raise RuntimeError("対象の連系線が0件です(TARGET_VALUES の指定を確認してください)")
+            log.info("連系線: %s", options)
+
+            for d in dates:
+                for v, _ in options:
+                    if (d, v) not in done and already_final(d, v):
+                        done.add((d, v))
+            pending = [(d, v, t) for d in dates for v, t in options if (d, v) not in done]
+            log.info("未取得 %d件 / 全%d件", len(pending), len(dates) * len(options))
+
+            fetched = 0
+            for d, v, t in pending:
+                if fetched >= MAX_PER_SESSION:
+                    log.info("%d件取得したので計画的に再接続します", fetched)
+                    return False
+                log.info("取得開始: %s %s %s", d, v, t)
+                if STATE["method"]:
+                    methods = [STATE["method"]]
+                else:   # 未証明: 不一致になった方式は後回しにして、別の方式を先に試す
+                    methods = ([m for m in DATE_METHODS if m not in STATE["failed"]]
+                               + [m for m in DATE_METHODS if m in STATE["failed"]])
+                saved = False
+                mismatched = False
+                for method in methods:
+                    if page2 is None:       # 前回の画面は閉じてあるので、新しく開く
+                        page2 = open_popup(menu)
+                        check_error_page(page2)
+                    try:
+                        set_date(page2, d, method)
+                    except DateSetError as e:
+                        log.warning("日付設定に失敗(%s): %s", method, e)
+                        page2.close()
+                        page2 = None
+                        continue
+                    dl = fetch_one(page2, v)
+                    good = save_download(dl, d, v, t)
+                    settle(page2)
+                    # 使い回すと次の「CSV保存」で確認ダイアログが出なくなるため、毎回閉じる
+                    try:
+                        page2.close()
+                    except Exception:
+                        pass
+                    page2 = None
+                    if good:
+                        if STATE["method"] != method:
+                            log.info("日付設定は '%s' 方式で正しく反映されました。以後この方式を使います", method)
+                        STATE["method"] = method
+                        saved = True
+                        break
+                    # 日付不一致: 同じ状態の画面で続けず、接続をやり直す(サーバー側の状態が崩れている恐れ)
+                    mismatched = True
+                    if not STATE["method"]:
+                        STATE["failed"].add(method)
+                    break
+                if not saved and mismatched:
+                    raise RuntimeError(
+                        f"CSVの日付が不一致でした(方式 {method})。接続をやり直します")
+                if not saved:
+                    raise FatalError(
+                        "どの日付設定方式でも、CSVの日付が一致しませんでした"
+                        f"(試した方式: {methods})。カレンダー部分のcodegenを確認してください。")
+                done.add((d, v))
+                fetched += 1
+                wait = INTERVAL_SEC + random.uniform(0, INTERVAL_JITTER_SEC)
+                log.info("%.1f秒待機", wait)
+                time.sleep(wait)
+            return True
+        except Exception:
+            shot = OUT_DIR.parent / f"error_{dt.datetime.now():%Y%m%d_%H%M%S}.png"
+            try:
+                context.pages[-1].screenshot(path=str(shot), full_page=True)
+                log.info("エラー画面を保存: %s", shot)
+            except Exception:
+                pass
+            raise
+        finally:
+            context.close()
+            browser.close()
+
+
+def acquire_lock():
+    """二重起動を防ぐ。取得できたら True。"""
+    lock = OUT_DIR.parent / "occto_download.lock"
+    if lock.exists() and time.time() - lock.stat().st_mtime < LOCK_STALE_SEC:
+        return None
+    lock.write_text(str(time.time()), encoding="utf-8")
+    return lock
+
+
+def main():
+    lock = acquire_lock()
+    if lock is None:
+        log.warning("前回の実行がまだ続いているようです(ロックファイルあり)。今回は実行しません。")
+        return 0
+    try:
+        return run_all()
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def run_all():
+    done = set()
+    dates = target_dates()
+    log.info("対象日付: %s ～ %s", dates[0], dates[-1])
+    failures = 0   # 連続失敗回数(進捗があればリセット)
+    while True:
+        before = len(done)
+        try:
+            log.info("接続開始 (取得済み %d件, 連続失敗 %d回)", len(done), failures)
+            if run_session(done, dates):
+                log.info("完了: %d件", len(done))
+                return 0
+            failures = 0                    # 計画的な再接続
+            time.sleep(RETRY_WAIT_SEC / 3)
+        except FatalError as e:
+            log.error("致命的: %s", e)
+            return 2
+        except Exception as e:  # noqa: BLE001
+            log.warning("失敗: %s", e)
+            if len(done) > before:
+                failures = 0                # 進捗があれば失敗カウントをリセット
+            failures += 1
+            if failures >= MAX_RETRIES:
+                log.error("連続失敗の上限。取得済み: %d件", len(done))
+                return 1
+            wait = RETRY_BACKOFF_SEC[min(failures - 1, len(RETRY_BACKOFF_SEC) - 1)]
+            log.info("サーバー側の回復を待つため %d秒後に新規接続します", wait)
+            time.sleep(wait)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
